@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from typing import Any
 
@@ -7,81 +8,115 @@ import httpx
 from app.config import settings
 
 
+def _ollama_error_message(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    return None
+
+
+def _parse_embedding_response(data: dict[str, Any]) -> list[float] | None:
+    err = _ollama_error_message(data)
+    if err:
+        raise ValueError(err)
+
+    embs = data.get("embeddings")
+    if isinstance(embs, list) and embs and isinstance(embs[0], list):
+        return embs[0]
+
+    emb = data.get("embedding")
+    if isinstance(emb, list):
+        return emb
+
+    data0 = (data.get("data") or [{}])[0] or {}
+    emb = data0.get("embedding")
+    if isinstance(emb, list):
+        return emb
+
+    return None
+
+
 async def ollama_embed(text: str) -> list[float]:
     async with httpx.AsyncClient(timeout=120.0) as client:
         base = settings.ollama_host.rstrip("/")
         errors: list[str] = []
 
-        # Ollama newer endpoint (batch): POST /api/embed { model, input }
-        try:
-            r = await client.post(
-                f"{base}/api/embed",
-                json={"model": settings.ollama_embed_model, "input": text},
-            )
-            if r.status_code != 404:
-                r.raise_for_status()
+        for path, payload in (
+            ("/api/embed", {"model": settings.ollama_embed_model, "input": text}),
+            ("/api/embeddings", {"model": settings.ollama_embed_model, "prompt": text}),
+            ("/v1/embeddings", {"model": settings.ollama_embed_model, "input": text}),
+        ):
+            try:
+                r = await client.post(f"{base}{path}", json=payload)
+                if r.status_code == 404 and not r.content:
+                    continue
                 data = r.json()
-                embs = data.get("embeddings")
-                if isinstance(embs, list) and embs and isinstance(embs[0], list):
-                    emb = embs[0]
-                else:
-                    emb = None
+                if r.status_code >= 400:
+                    msg = _ollama_error_message(data) or r.text.strip() or f"HTTP {r.status_code}"
+                    raise ValueError(msg)
+                emb = _parse_embedding_response(data)
                 if not emb:
-                    raise ValueError("missing embeddings[0] in /api/embed response")
+                    raise ValueError(f"missing embedding vector in {path} response")
                 if len(emb) != settings.embedding_dimensions:
                     raise ValueError(
                         f"embedding size mismatch: got {len(emb)}, "
                         f"expected {settings.embedding_dimensions}"
                     )
                 return emb
-        except Exception as e:
-            errors.append(f"/api/embed: {e!s}")
+            except Exception as e:
+                if str(e).strip():
+                    errors.append(f"{path}: {e!s}")
 
-        # Ollama legacy endpoint: POST /api/embeddings { model, prompt }
-        try:
-            r = await client.post(
-                f"{base}/api/embeddings",
-                json={"model": settings.ollama_embed_model, "prompt": text},
-            )
-            if r.status_code != 404:
-                r.raise_for_status()
-                data = r.json()
-                emb = data.get("embedding")
-                if not emb:
-                    raise ValueError("missing embedding in /api/embeddings response")
-                if len(emb) != settings.embedding_dimensions:
-                    raise ValueError(
-                        f"embedding size mismatch: got {len(emb)}, "
-                        f"expected {settings.embedding_dimensions}"
-                    )
-                return emb
-        except Exception as e:
-            errors.append(f"/api/embeddings: {e!s}")
+        raise RuntimeError(" | ".join(errors) if errors else "no embedding endpoint available")
 
-        # OpenAI-compatible endpoint (some Ollama setups/proxies expose this):
-        # POST /v1/embeddings { model, input }
-        try:
-            r = await client.post(
-                f"{base}/v1/embeddings",
-                json={"model": settings.ollama_embed_model, "input": text},
-            )
-            if r.status_code != 404:
-                r.raise_for_status()
-                data = r.json()
-                data0 = (data.get("data") or [{}])[0] or {}
-                emb = data0.get("embedding")
-                if not emb:
-                    raise ValueError("missing data[0].embedding in /v1/embeddings response")
-                if len(emb) != settings.embedding_dimensions:
-                    raise ValueError(
-                        f"embedding size mismatch: got {len(emb)}, "
-                        f"expected {settings.embedding_dimensions}"
-                    )
-                return emb
-        except Exception as e:
-            errors.append(f"/v1/embeddings: {e!s}")
 
-        raise RuntimeError(" | ".join(errors))
+def _salvage_json_object(msg: str) -> dict[str, Any]:
+    text = (msg or "").strip()
+    if not text:
+        return {}
+
+    out: dict[str, Any] = {}
+    for key in (
+        "category",
+        "taxTreatment",
+        "primaryAccountName",
+        "primaryAccountCode",
+        "primaryAccountId",
+    ):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', text)
+        if match:
+            out[key] = match.group(1)
+
+    conf = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+    if conf:
+        out["confidence"] = float(conf.group(1))
+
+    alts = re.search(r'"alternativeAccountNames"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+    if alts:
+        out["alternativeAccountNames"] = re.findall(r'"([^"]+)"', alts.group(1))
+
+    return out
+
+
+def _parse_model_json(msg: str) -> dict[str, Any]:
+    text = (msg or "").strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    return _salvage_json_object(text)
 
 
 async def ollama_chat_json(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -91,6 +126,7 @@ async def ollama_chat_json(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "messages": messages,
         "stream": False,
         "format": "json",
+        "options": {"num_predict": 512},
     }
     t0 = time.time()
     async with httpx.AsyncClient(timeout=180.0) as client:
@@ -99,9 +135,5 @@ async def ollama_chat_json(messages: list[dict[str, Any]]) -> dict[str, Any]:
         data = r.json()
     msg = (data.get("message") or {}).get("content") or "{}"
     latency_ms = int((time.time() - t0) * 1000)
-
-    try:
-        parsed = json.loads(msg)
-    except json.JSONDecodeError:
-        parsed = {}
+    parsed = _parse_model_json(msg)
     return {"json": parsed, "latencyMs": latency_ms, "raw": msg}

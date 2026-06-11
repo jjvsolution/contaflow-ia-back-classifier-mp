@@ -72,7 +72,7 @@ def build_system_prompt(
     chart_txt = ""
     if chart:
         lines = []
-        for a in chart[:1000]:
+        for a in chart[:80]:
             code = a.get("code") or ""
             nm = a.get("name") or ""
             lines.append(f"- {code} {nm}".strip())
@@ -81,7 +81,7 @@ def build_system_prompt(
     ex_txt = ""
     if examples:
         blocks = []
-        for ex in examples[:12]:
+        for ex in examples[:6]:
             pj = ex.get("payloadJson")
             if hasattr(pj, "keys"):
                 payload = dict(pj)
@@ -168,6 +168,42 @@ def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict
     return sorted(examples, key=score, reverse=True)
 
 
+def chart_for_prompt(chart: list[dict], kind: str, limit: int = 60) -> list[dict]:
+    if not chart:
+        return []
+
+    code_prefixes: tuple[str, ...]
+    if kind == "purchase":
+        code_prefixes = ("5.", "2.1", "1.1", "1.2")
+    elif kind == "sale":
+        code_prefixes = ("4.", "1.1", "2.1")
+    elif kind == "fee":
+        code_prefixes = ("5.", "2.1")
+    else:
+        code_prefixes = ("5.", "4.", "2.1", "1.1")
+
+    filtered = [
+        a
+        for a in chart
+        if str(a.get("code") or "").startswith(code_prefixes)
+    ]
+    pool = filtered if len(filtered) >= 15 else chart
+    return pool[:limit]
+
+
+def is_valid_classification(raw: dict[str, Any]) -> bool:
+    if not raw:
+        return False
+    category = str(raw.get("category") or "").strip()
+    account = str(
+        raw.get("primaryAccountName")
+        or raw.get("primaryAccountCode")
+        or raw.get("primaryAccountId")
+        or ""
+    ).strip()
+    return bool(category) and bool(account)
+
+
 async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     inp = body.get("input") or {}
     request_id = inp.get("requestId") or body.get("requestId") or str(uuid.uuid4())
@@ -212,17 +248,44 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         examples = []
 
     chart = (inp.get("accountingContext") or {}).get("chartOfAccountsTop") or []
+    prompt_chart = chart_for_prompt(chart, kind)
     messages = [
-        {"role": "system", "content": build_system_prompt(chart, examples, wants_entry)},
+        {
+            "role": "system",
+            "content": build_system_prompt(prompt_chart, examples, wants_entry),
+        },
         {"role": "user", "content": user_payload(inp, wants_entry)},
     ]
 
+    raw: dict[str, Any] = {}
+    latency = 0
     try:
-        chat_out = await ollama_client.ollama_chat_json(messages)
-        raw = chat_out["json"]
-        latency = chat_out["latencyMs"]
+        for attempt in range(2):
+            chat_out = await ollama_client.ollama_chat_json(messages)
+            raw = chat_out["json"]
+            latency = chat_out["latencyMs"]
+            if is_valid_classification(raw):
+                break
+            if attempt == 0:
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "Respuesta incompleta. Devuelve SOLO JSON válido con "
+                            "category, taxTreatment y primaryAccountName del plan."
+                        ),
+                    },
+                ]
     except Exception as e:
         return error_result(request_id, inp, f"LLM error: {e!s}")
+
+    if not is_valid_classification(raw):
+        return error_result(
+            request_id,
+            inp,
+            "El modelo no devolvió category y primaryAccountName; intente de nuevo.",
+        )
 
     period = inp.get("period") or {}
     period_closed = bool(period.get("isClosed"))
@@ -261,6 +324,12 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         "high" if conf_val >= 0.8 else "medium" if conf_val >= 0.55 else "low"
     )
 
+    confidence = {
+        "value": conf_val,
+        "label": conf_label,
+        "rationaleShort": "Modelo local + RAG",
+    }
+
     result: dict[str, Any] = {
         "requestId": request_id,
         "kind": kind,
@@ -273,6 +342,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         },
         "classification": {"category": cat, "taxTreatment": tax},
         "suggestedAccount": {"primary": primary, "alternatives": alts or None},
+        "confidence": confidence,
         "previewPolicy": {
             "requiresHumanApproval": True,
             "periodIsClosedReadOnly": period_closed,
@@ -331,11 +401,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
                     "isBalanced": balanced,
                     "warnings": entry_warnings,
                 },
-                "confidence": {
-                    "value": conf_val,
-                    "label": conf_label,
-                    "rationaleShort": "Modelo local + RAG",
-                },
+                "confidence": confidence,
                 "explanation": {
                     "summary": "Sugerencia generada por modelo local con contexto recuperado.",
                     "bullets": [
