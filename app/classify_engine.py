@@ -226,7 +226,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     explain = options.get("explain", True)
 
     input_text = build_input_text(inp)
-
+    print('input_text =>', input_text)
     try:
         emb = await ollama_client.ollama_embed(input_text)
     except Exception as e:

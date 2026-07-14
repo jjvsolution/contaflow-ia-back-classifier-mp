@@ -137,3 +137,60 @@ async def ollama_chat_json(messages: list[dict[str, Any]]) -> dict[str, Any]:
     latency_ms = int((time.time() - t0) * 1000)
     parsed = _parse_model_json(msg)
     return {"json": parsed, "latencyMs": latency_ms, "raw": msg}
+
+
+def _model_matches(installed: str, required: str) -> bool:
+    inst = installed.lower().strip()
+    req = required.lower().strip()
+    return inst == req or inst.startswith(f"{req}:")
+
+
+async def ollama_list_model_names() -> list[str]:
+    url = f"{settings.ollama_host.rstrip('/')}/api/tags"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+    models = data.get("models") or []
+    names: list[str] = []
+    for m in models:
+        if isinstance(m, dict) and isinstance(m.get("name"), str):
+            names.append(m["name"])
+    return names
+
+
+async def ollama_ready_check() -> dict[str, Any]:
+    """Valida Ollama y que existan los modelos de chat y embeddings configurados."""
+    chat = settings.ollama_chat_model
+    embed = settings.ollama_embed_model
+    required = [chat, embed]
+
+    try:
+        installed = await ollama_list_model_names()
+    except Exception as e:
+        return {
+            "ok": False,
+            "ollama": "down",
+            "error": str(e),
+            "models": {
+                "required": {"chat": chat, "embed": embed},
+                "installed": [],
+                "missing": required,
+                "present": {"chat": False, "embed": False},
+            },
+        }
+
+    present_chat = any(_model_matches(n, chat) for n in installed)
+    present_embed = any(_model_matches(n, embed) for n in installed)
+    missing = [m for m, ok in ((chat, present_chat), (embed, present_embed)) if not ok]
+
+    return {
+        "ok": len(missing) == 0,
+        "ollama": "up",
+        "models": {
+            "required": {"chat": chat, "embed": embed},
+            "installed": installed,
+            "missing": missing,
+            "present": {"chat": present_chat, "embed": present_embed},
+        },
+    }

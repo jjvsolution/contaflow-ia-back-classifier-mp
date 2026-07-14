@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 
 from app.classify_engine import normalize_giro, run_classify
@@ -34,6 +34,24 @@ class LearnRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/ready")
+async def ready(response: Response):
+    """Readiness: Ollama vivo y modelos chat/embed disponibles."""
+    check = await ollama_client.ollama_ready_check()
+    payload = {
+        "status": "ready" if check["ok"] else "not_ready",
+        "checks": {
+            "ollama": check["ollama"],
+            "models": check["models"],
+        },
+    }
+    if check.get("error"):
+        payload["error"] = check["error"]
+    if not check["ok"]:
+        response.status_code = 503
+    return payload
 
 
 @app.post("/v1/classify")
