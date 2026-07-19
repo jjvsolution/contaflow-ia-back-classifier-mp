@@ -1,13 +1,19 @@
+import logging
+import time
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 
+from app import ollama_client
 from app.classify_engine import normalize_giro, run_classify
 from app.config import settings
 from app.db import insert_example
 from app.input_text import build_input_text
-from app import ollama_client
+from app.logging_setup import configure_logging, log_event
+
+configure_logging()
+logger = logging.getLogger("contaflow.ai.api")
 
 app = FastAPI(title="contaflow-ia-ai", version="0.1.0")
 
@@ -60,7 +66,21 @@ async def classify_v1(
     _: Annotated[None, Depends(verify_internal)],
 ):
     """Espera el mismo JSON que envía Nest (LlmRequest: requestId, purpose, input, ...)."""
-    return await run_classify(body)
+    t0 = time.perf_counter()
+    request_id = (body.get("input") or {}).get("requestId") or body.get("requestId")
+    try:
+        result = await run_classify(body)
+        return result
+    except Exception as e:
+        log_event(
+            logger,
+            "classify_unhandled",
+            level=logging.ERROR,
+            requestId=request_id,
+            latencyMs=int((time.perf_counter() - t0) * 1000),
+            error=str(e),
+        )
+        raise
 
 
 @app.post("/v1/learn")
@@ -68,6 +88,7 @@ async def learn_v1(
     req: LearnRequest,
     _: Annotated[None, Depends(verify_internal)],
 ):
+    t0 = time.perf_counter()
     if req.scope == "COMPANY" and not req.companyId:
         raise HTTPException(
             status_code=400,
@@ -97,6 +118,15 @@ async def learn_v1(
         input_text=text,
         payload=req.payload,
         embedding=emb,
+    )
+    log_event(
+        logger,
+        "learn_done",
+        requestId=(inp or {}).get("requestId"),
+        tenantId=req.tenantId,
+        companyId=req.companyId,
+        scope=req.scope,
+        latencyMs=int((time.perf_counter() - t0) * 1000),
     )
     return {"ok": True}
 

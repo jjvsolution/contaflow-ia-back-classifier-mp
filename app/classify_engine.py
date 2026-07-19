@@ -1,12 +1,21 @@
 import json
+import logging
 import re
+import time
 import uuid
 from typing import Any
 
 from app.config import settings
 from app.db import search_examples
 from app.input_text import build_input_text, map_kind_to_document_kind
+from app.logging_setup import log_event
 from app import ollama_client
+
+logger = logging.getLogger("contaflow.ai.classify")
+
+
+def _elapsed_ms(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
 
 
 def normalize_giro(giro: str) -> str:
@@ -205,11 +214,21 @@ def is_valid_classification(raw: dict[str, Any]) -> bool:
 
 
 async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
+    t0 = time.perf_counter()
     inp = body.get("input") or {}
     request_id = inp.get("requestId") or body.get("requestId") or str(uuid.uuid4())
+    purpose = body.get("purpose")
 
     tenant_id = inp.get("tenantId")
     if not tenant_id:
+        log_event(
+            logger,
+            "classify_error",
+            requestId=request_id,
+            purpose=purpose,
+            code="MISSING_TENANT",
+            latencyMs=_elapsed_ms(t0),
+        )
         return error_result(request_id, inp, "ClassificationInput.tenantId es requerido para RAG.")
 
     company = inp.get("company") or {}
@@ -217,6 +236,14 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     giro = company.get("giro") or ""
     giro_key = normalize_giro(giro)
     if not company_id:
+        log_event(
+            logger,
+            "classify_error",
+            requestId=request_id,
+            purpose=purpose,
+            code="MISSING_COMPANY",
+            latencyMs=_elapsed_ms(t0),
+        )
         return error_result(request_id, inp, "company.companyId es requerido.")
 
     kind = inp.get("kind") or "purchase"
@@ -225,11 +252,41 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     wants_entry = (options.get("mode") or "suggest") == "suggest"
     explain = options.get("explain", True)
 
+    log_event(
+        logger,
+        "classify_start",
+        requestId=request_id,
+        purpose=purpose,
+        kind=kind,
+        companyId=company_id,
+    )
+
     input_text = build_input_text(inp)
-    print('input_text =>', input_text)
+    logger.debug(
+        json.dumps(
+            {
+                "event": "classify_input_text",
+                "requestId": request_id,
+                "chars": len(input_text),
+                # Solo en DEBUG: no volcar documento completo en INFO/prod
+                "preview": input_text[:240],
+            },
+            ensure_ascii=False,
+        )
+    )
     try:
         emb = await ollama_client.ollama_embed(input_text)
     except Exception as e:
+        log_event(
+            logger,
+            "classify_error",
+            requestId=request_id,
+            purpose=purpose,
+            kind=kind,
+            code="EMBEDDING_ERROR",
+            latencyMs=_elapsed_ms(t0),
+            error=str(e),
+        )
         return error_result(request_id, inp, f"Embedding error: {e!s}")
 
     examples: list[dict] = []
@@ -244,7 +301,14 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
             settings.rag_giro_limit,
         )
         examples = rank_examples_for_prompt(examples, input_text)
-    except Exception:
+    except Exception as e:
+        log_event(
+            logger,
+            "classify_rag_fallback",
+            level=logging.WARNING,
+            requestId=request_id,
+            error=str(e),
+        )
         examples = []
 
     chart = (inp.get("accountingContext") or {}).get("chartOfAccountsTop") or []
@@ -278,9 +342,30 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
                     },
                 ]
     except Exception as e:
+        log_event(
+            logger,
+            "classify_error",
+            requestId=request_id,
+            purpose=purpose,
+            kind=kind,
+            code="LLM_ERROR",
+            latencyMs=_elapsed_ms(t0),
+            llmLatencyMs=latency,
+            error=str(e),
+        )
         return error_result(request_id, inp, f"LLM error: {e!s}")
 
     if not is_valid_classification(raw):
+        log_event(
+            logger,
+            "classify_error",
+            requestId=request_id,
+            purpose=purpose,
+            kind=kind,
+            code="INVALID_MODEL_OUTPUT",
+            latencyMs=_elapsed_ms(t0),
+            llmLatencyMs=latency,
+        )
         return error_result(
             request_id,
             inp,
@@ -420,6 +505,20 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     else:
         result["suggestedEntry"] = None
 
+    total_ms = _elapsed_ms(t0)
+    result["provider"]["latencyMs"] = total_ms
+    log_event(
+        logger,
+        "classify_done",
+        requestId=request_id,
+        purpose=purpose,
+        kind=kind,
+        outcome=result.get("outcome"),
+        latencyMs=total_ms,
+        llmLatencyMs=latency,
+        ragExamples=len(examples),
+        category=cat,
+    )
     return {"requestId": body.get("requestId") or request_id, "json": result}
 
 
