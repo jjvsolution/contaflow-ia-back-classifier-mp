@@ -73,10 +73,64 @@ def pick_chart_ref(name: str, chart: list[dict] | None) -> dict[str, Any]:
     return {"name": raw}
 
 
+def resolve_purpose(body: dict[str, Any], kind: str) -> str:
+    """Normaliza purpose del request; si falta, deriva desde kind."""
+    raw = str(body.get("purpose") or "").strip().lower()
+    allowed = {
+        "classify_purchase",
+        "classify_sale",
+        "classify_fee",
+        "classify_bank_line",
+        "suggest_journal_entry",
+    }
+    if raw in allowed:
+        return raw
+    if kind == "purchase":
+        return "classify_purchase"
+    if kind == "sale":
+        return "classify_sale"
+    if kind == "fee":
+        return "classify_fee"
+    if kind == "bank_statement_line":
+        return "classify_bank_line"
+    return "classify_purchase"
+
+
+PURPOSE_PROMPT_VARIANTS: dict[str, str] = {
+    "classify_purchase": (
+        "PURPOSE=classify_purchase. Clasifica una COMPRA / factura de proveedor. "
+        "Prioriza gasto o costo (cuentas 5.x), IVA crédito fiscal cuando aplique (vat_affected), "
+        "y pasivos/proveedores si el contexto es deuda. Distingue activo fijo vs gasto corriente."
+    ),
+    "classify_sale": (
+        "PURPOSE=classify_sale. Clasifica una VENTA / factura a cliente. "
+        "Prioriza ingresos (cuentas 4.x), IVA débito fiscal cuando aplique, "
+        "y clientes/caja según el cobro. No uses cuentas de gasto de compra."
+    ),
+    "classify_fee": (
+        "PURPOSE=classify_fee. Clasifica una BOLETA DE HONORARIOS (prestador de servicio). "
+        "Prioriza gasto por honorarios/servicios profesionales (5.x), retención si aparece en el texto, "
+        "y tratamiento tributario coherente con honorarios en Chile (a menudo vat_exempt o unknown si no hay IVA SII)."
+    ),
+    "classify_bank_line": (
+        "PURPOSE=classify_bank_line. Clasifica un MOVIMIENTO DE CARTOLA BANCARIA. "
+        "Monto negativo ≈ egreso/cargo; positivo ≈ ingreso/abono. "
+        "Sugiere cuenta bancaria (1.1) y contrapartida (gasto/ingreso/pasivo) según la glosa. "
+        "Evita clasificar como factura de compra/venta salvo evidencia clara."
+    ),
+    "suggest_journal_entry": (
+        "PURPOSE=suggest_journal_entry. El foco es el ASIENTO contable (debe/haber) en CLP. "
+        "Las journalLines son obligatorias, balanceadas, con cuentas del plan, "
+        "y memos útiles. La categoría/taxTreatment deben alinear con el asiento propuesto."
+    ),
+}
+
+
 def build_system_prompt(
     chart: list[dict] | None,
     examples: list[dict],
     wants_entry: bool,
+    purpose: str = "classify_purchase",
 ) -> str:
     chart_txt = ""
     if chart:
@@ -103,8 +157,9 @@ def build_system_prompt(
             )
         ex_txt = "\n\n".join(blocks)
 
-    entry_instr = ""
-    if wants_entry:
+    # suggest_journal_entry siempre pide asiento; el resto respeta wants_entry.
+    force_entry = purpose == "suggest_journal_entry"
+    if force_entry or wants_entry:
         entry_instr = (
             "Incluye journalLines: lista de líneas con accountName, debit (string o vacío), "
             "credit (string o vacío), memo opcional. Usa cuentas exactas del plan, idealmente "
@@ -113,11 +168,17 @@ def build_system_prompt(
     else:
         entry_instr = "NO incluyas journalLines; solo clasificación y cuenta sugerida."
 
+    purpose_block = PURPOSE_PROMPT_VARIANTS.get(
+        purpose,
+        PURPOSE_PROMPT_VARIANTS["classify_purchase"],
+    )
+
     return (
         "Eres un asistente contable para Chile (CLP). Responde SOLO JSON válido, sin markdown. "
         "Campos requeridos: category (snake_case corto), taxTreatment (vat_affected|vat_exempt|unknown), "
         "primaryAccountName (nombre exacto, código o 'codigo - nombre' que exista en el plan si es posible), "
         "alternativeAccountNames (array de strings, opcional), confidence (0..1)."
+        f"\n\n{purpose_block}"
         f"\n{entry_instr}\n\n{chart_txt}\n\nEjemplos similares del mismo cliente/giro:\n{ex_txt}"
     )
 
@@ -217,10 +278,10 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     t0 = time.perf_counter()
     inp = body.get("input") or {}
     request_id = inp.get("requestId") or body.get("requestId") or str(uuid.uuid4())
-    purpose = body.get("purpose")
 
     tenant_id = inp.get("tenantId")
     if not tenant_id:
+        purpose = resolve_purpose(body, str(inp.get("kind") or "purchase"))
         log_event(
             logger,
             "classify_error",
@@ -236,6 +297,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     giro = company.get("giro") or ""
     giro_key = normalize_giro(giro)
     if not company_id:
+        purpose = resolve_purpose(body, str(inp.get("kind") or "purchase"))
         log_event(
             logger,
             "classify_error",
@@ -247,9 +309,10 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         return error_result(request_id, inp, "company.companyId es requerido.")
 
     kind = inp.get("kind") or "purchase"
+    purpose = resolve_purpose(body, str(kind))
     doc_kind = map_kind_to_document_kind(kind)
     options = inp.get("options") or {}
-    wants_entry = (options.get("mode") or "suggest") == "suggest"
+    wants_entry = (options.get("mode") or "suggest") == "suggest" or purpose == "suggest_journal_entry"
     explain = options.get("explain", True)
 
     log_event(
@@ -316,7 +379,9 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     messages = [
         {
             "role": "system",
-            "content": build_system_prompt(prompt_chart, examples, wants_entry),
+            "content": build_system_prompt(
+                prompt_chart, examples, wants_entry, purpose=purpose
+            ),
         },
         {"role": "user", "content": user_payload(inp, wants_entry)},
     ]
