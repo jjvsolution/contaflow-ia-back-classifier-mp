@@ -10,6 +10,10 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M01-023 — ciclo RAG
+
+Backend con `LLM_LEARNING_ENABLED=true` envía ejemplos a `/v1/learn` al confirmar. Classify reutiliza ejemplos vía `search_examples` + ranking por contraparte. Tests: `test_rag_cycle_m01_023.py` (AI) y `llm-learning.service.spec.ts` (back).
+
 ### M01-021 — prompt por `purpose`
 
 `build_system_prompt` especializa el system prompt según `classify_purchase|sale|fee|bank_line` (y `suggest_journal_entry`). Evidencia: `python -m unittest tests.test_purpose_prompt_m01_021`.
