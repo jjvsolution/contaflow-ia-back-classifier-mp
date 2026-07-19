@@ -13,6 +13,18 @@ def get_conn():
         yield conn
 
 
+def postgres_ready_check() -> dict:
+    """Ping de PostgreSQL para readiness (M01-020)."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return {"status": "up"}
+    except Exception as e:
+        return {"status": "down", "error": str(e)}
+
+
 def vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(str(x) for x in vec) + "]"
 

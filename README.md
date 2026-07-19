@@ -10,6 +10,10 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M01-020 — `/health/ready` compuesto
+
+`GET /health/ready` (y alias `GET /ready`) valida PostgreSQL + Ollama con modelos chat/embed. Responde **503** si falla alguna dependencia. Evidencia: `python -m unittest tests.test_health_ready_m01_020`.
+
 ### M01-018 — logging estructurado
 
 Sin `print` de debug. Logs JSON en stdout con `event`, `requestId`, `latencyMs` (y `llmLatencyMs` cuando aplica). Nivel: `LOG_LEVEL=INFO` (prod) o `DEBUG` (preview de input). Evidencia: `python -m unittest tests.test_logging_m01_018`.

@@ -11,6 +11,7 @@ from app.config import settings
 from app.db import insert_example
 from app.input_text import build_input_text
 from app.logging_setup import configure_logging, log_event
+from app.readiness import composite_ready_check
 
 configure_logging()
 logger = logging.getLogger("contaflow.ai.api")
@@ -42,22 +43,24 @@ async def health():
     return {"ok": True}
 
 
-@app.get("/ready")
-async def ready(response: Response):
-    """Readiness: Ollama vivo y modelos chat/embed disponibles."""
-    check = await ollama_client.ollama_ready_check()
-    payload = {
-        "status": "ready" if check["ok"] else "not_ready",
-        "checks": {
-            "ollama": check["ollama"],
-            "models": check["models"],
-        },
-    }
-    if check.get("error"):
-        payload["error"] = check["error"]
-    if not check["ok"]:
+async def _ready_response(response: Response) -> dict[str, Any]:
+    """PostgreSQL + Ollama con modelos; 503 si alguna dependencia falla."""
+    payload = await composite_ready_check()
+    if not payload.get("ok"):
         response.status_code = 503
     return payload
+
+
+@app.get("/health/ready")
+async def health_ready(response: Response):
+    """M01-020: readiness compuesto (Postgres + Ollama/modelos)."""
+    return await _ready_response(response)
+
+
+@app.get("/ready")
+async def ready(response: Response):
+    """Alias de /health/ready (compatible con Nest GET …/ready)."""
+    return await _ready_response(response)
 
 
 @app.post("/v1/classify")
