@@ -10,6 +10,10 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M01-024 — upsert RAG por sourceId
+
+`POST /v1/learn` hace upsert por `(tenantId, scope, sourceType, sourceId)`: el segundo learn del mismo documento **actualiza** embedding/payload y no duplica filas. Respuesta: `{ ok, id, updated }`. Índice único parcial en migración Prisma. Evidencia: `python -m unittest tests.test_upsert_rag_m01_024`.
+
 ### M01-022 — `ragStatus` en classify
 
 La respuesta de classify incluye `ragStatus: ok|degraded|failed` (y `ragExamplesUsed`). Fallo de búsqueda RAG o embedding → `failed`; 0 ejemplos → `degraded`. Evidencia: `python -m unittest tests.test_rag_status_m01_022`.

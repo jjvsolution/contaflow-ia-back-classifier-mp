@@ -94,7 +94,30 @@ def search_examples(
     return results
 
 
-def insert_example(
+def find_example_id_by_source(
+    tenant_id: str,
+    scope: str,
+    source_type: str,
+    source_id: str,
+) -> str | None:
+    """Busca ejemplo RAG por clave lógica (M01-024)."""
+    sql = """
+    SELECT id FROM "AccountingKnowledgeExample"
+    WHERE "tenantId" = %s
+      AND "scope" = %s::"KnowledgeScope"
+      AND "sourceType" = %s
+      AND "sourceId" = %s
+    ORDER BY "createdAt" DESC
+    LIMIT 1;
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (tenant_id, scope, source_type, source_id))
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+
+
+def upsert_example(
     tenant_id: str,
     company_id: str | None,
     giro_key: str,
@@ -105,13 +128,50 @@ def insert_example(
     input_text: str,
     payload: dict,
     embedding: list[float],
-) -> str:
+) -> dict:
+    """
+    Inserta o actualiza un ejemplo RAG.
+    Si hay sourceType+sourceId, el segundo learn actualiza (no duplica) — M01-024.
+    """
     import uuid
 
-    row_id = str(uuid.uuid4())
     vec_lit = vector_literal(embedding)
+    can_upsert = bool(source_type and source_id)
 
-    sql = """
+    if can_upsert:
+        existing_id = find_example_id_by_source(
+            tenant_id, scope, source_type, source_id
+        )
+        if existing_id:
+            sql_update = """
+            UPDATE "AccountingKnowledgeExample"
+            SET "companyId" = %s,
+                "giroKey" = %s,
+                "documentKind" = %s::"DocumentKind",
+                "inputText" = %s,
+                "payloadJson" = %s::jsonb,
+                "embedding" = %s::vector
+            WHERE id = %s;
+            """
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql_update,
+                        (
+                            company_id,
+                            giro_key,
+                            document_kind,
+                            input_text,
+                            Json(payload),
+                            vec_lit,
+                            existing_id,
+                        ),
+                    )
+                conn.commit()
+            return {"id": existing_id, "updated": True}
+
+    row_id = str(uuid.uuid4())
+    sql_insert = """
     INSERT INTO "AccountingKnowledgeExample"
       (id, "tenantId", "companyId", "giroKey", "scope", "documentKind",
        "sourceType", "sourceId", "inputText", "payloadJson", "embedding")
@@ -123,7 +183,7 @@ def insert_example(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                sql,
+                sql_insert,
                 (
                     row_id,
                     tenant_id,
@@ -139,4 +199,32 @@ def insert_example(
                 ),
             )
         conn.commit()
-    return row_id
+    return {"id": row_id, "updated": False}
+
+
+def insert_example(
+    tenant_id: str,
+    company_id: str | None,
+    giro_key: str,
+    scope: str,
+    document_kind: str,
+    source_type: str | None,
+    source_id: str | None,
+    input_text: str,
+    payload: dict,
+    embedding: list[float],
+) -> str:
+    """Compat: delega en upsert_example y devuelve el id."""
+    result = upsert_example(
+        tenant_id=tenant_id,
+        company_id=company_id,
+        giro_key=giro_key,
+        scope=scope,
+        document_kind=document_kind,
+        source_type=source_type,
+        source_id=source_id,
+        input_text=input_text,
+        payload=payload,
+        embedding=embedding,
+    )
+    return result["id"]

@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from app import ollama_client
 from app.classify_engine import normalize_giro, run_classify
 from app.config import settings
-from app.db import insert_example
+from app.db import upsert_example
 from app.input_text import build_input_text
 from app.logging_setup import configure_logging, log_event
 from app.readiness import composite_ready_check
@@ -110,7 +110,7 @@ async def learn_v1(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"embedding failed: {e!s}") from e
 
-    insert_example(
+    result = upsert_example(
         tenant_id=req.tenantId,
         company_id=req.companyId,
         giro_key=normalize_giro(req.giroKey),
@@ -129,9 +129,11 @@ async def learn_v1(
         tenantId=req.tenantId,
         companyId=req.companyId,
         scope=req.scope,
+        exampleId=result["id"],
+        updated=result["updated"],
         latencyMs=int((time.perf_counter() - t0) * 1000),
     )
-    return {"ok": True}
+    return {"ok": True, "id": result["id"], "updated": result["updated"]}
 
 
 def run_sync():
