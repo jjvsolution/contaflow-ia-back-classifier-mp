@@ -18,6 +18,19 @@ def _elapsed_ms(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
 
 
+def compute_rag_status(
+    *,
+    failed: bool,
+    examples_count: int,
+) -> str:
+    """M01-022: ok | degraded | failed."""
+    if failed:
+        return "failed"
+    if examples_count <= 0:
+        return "degraded"
+    return "ok"
+
+
 def normalize_giro(giro: str) -> str:
     return " ".join(giro.strip().lower().split())
 
@@ -349,10 +362,18 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
             code="EMBEDDING_ERROR",
             latencyMs=_elapsed_ms(t0),
             error=str(e),
+            ragStatus="failed",
         )
-        return error_result(request_id, inp, f"Embedding error: {e!s}")
+        return error_result(
+            request_id,
+            inp,
+            f"Embedding error: {e!s}",
+            rag_status="failed",
+        )
 
     examples: list[dict] = []
+    rag_failed = False
+    rag_error: str | None = None
     try:
         examples = search_examples(
             tenant_id,
@@ -365,14 +386,22 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         )
         examples = rank_examples_for_prompt(examples, input_text)
     except Exception as e:
+        rag_failed = True
+        rag_error = str(e)
         log_event(
             logger,
             "classify_rag_fallback",
             level=logging.WARNING,
             requestId=request_id,
-            error=str(e),
+            error=rag_error,
+            ragStatus="failed",
         )
         examples = []
+
+    rag_status = compute_rag_status(
+        failed=rag_failed,
+        examples_count=len(examples),
+    )
 
     chart = (inp.get("accountingContext") or {}).get("chartOfAccountsTop") or []
     prompt_chart = chart_for_prompt(chart, kind)
@@ -480,10 +509,22 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         "rationaleShort": "Modelo local + RAG",
     }
 
+    warnings: list[str] = []
+    if rag_status == "failed":
+        warnings.append(
+            f"RAG falló; clasificación sin ejemplos históricos ({rag_error or 'error'})."
+        )
+    elif rag_status == "degraded":
+        warnings.append(
+            "RAG degradado: no hay ejemplos previos para este tenant/giro/tipo."
+        )
+
     result: dict[str, Any] = {
         "requestId": request_id,
         "kind": kind,
         "outcome": "suggested",
+        "ragStatus": rag_status,
+        "ragExamplesUsed": len(examples),
         "provider": {
             "type": "local",
             "model": settings.ollama_chat_model,
@@ -497,7 +538,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
             "requiresHumanApproval": True,
             "periodIsClosedReadOnly": period_closed,
         },
-        "warnings": [],
+        "warnings": warnings,
     }
 
     if wants_entry:
@@ -581,31 +622,38 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         outcome=result.get("outcome"),
         latencyMs=total_ms,
         llmLatencyMs=latency,
+        ragStatus=rag_status,
         ragExamples=len(examples),
         category=cat,
     )
     return {"requestId": body.get("requestId") or request_id, "json": result}
 
 
-def error_result(request_id: str, inp: dict, msg: str) -> dict[str, Any]:
+def error_result(
+    request_id: str,
+    inp: dict,
+    msg: str,
+    *,
+    rag_status: str | None = None,
+) -> dict[str, Any]:
     kind = inp.get("kind") or "purchase"
-    return {
+    payload: dict[str, Any] = {
         "requestId": request_id,
-        "json": {
-            "requestId": request_id,
-            "kind": kind,
-            "outcome": "error",
-            "provider": {
-                "type": "local",
-                "model": settings.ollama_chat_model,
-                "promptVersion": "rag-v1",
-            },
-            "classification": {"category": "unknown", "taxTreatment": "unknown"},
-            "previewPolicy": {
-                "requiresHumanApproval": True,
-                "periodIsClosedReadOnly": bool((inp.get("period") or {}).get("isClosed")),
-            },
-            "warnings": [],
-            "errors": [{"code": "AI_ERROR", "message": msg}],
+        "kind": kind,
+        "outcome": "error",
+        "provider": {
+            "type": "local",
+            "model": settings.ollama_chat_model,
+            "promptVersion": "rag-v1",
         },
+        "classification": {"category": "unknown", "taxTreatment": "unknown"},
+        "previewPolicy": {
+            "requiresHumanApproval": True,
+            "periodIsClosedReadOnly": bool((inp.get("period") or {}).get("isClosed")),
+        },
+        "warnings": [],
+        "errors": [{"code": "AI_ERROR", "message": msg}],
     }
+    if rag_status:
+        payload["ragStatus"] = rag_status
+    return {"requestId": request_id, "json": payload}
