@@ -10,6 +10,7 @@ from app.classify_engine import normalize_giro, run_classify
 from app.config import settings
 from app.db import upsert_example
 from app.input_text import build_input_text
+from app.llm_schemas import LlmRequest
 from app.logging_setup import configure_logging, log_event
 from app.readiness import composite_ready_check
 
@@ -65,14 +66,15 @@ async def ready(response: Response):
 
 @app.post("/v1/classify")
 async def classify_v1(
-    body: dict[str, Any],
+    body: LlmRequest,
     _: Annotated[None, Depends(verify_internal)],
 ):
-    """Espera el mismo JSON que envía Nest (LlmRequest: requestId, purpose, input, ...)."""
+    """Body validado con Pydantic (= LlmRequest / llm.types.ts). Inválido → 422."""
     t0 = time.perf_counter()
-    request_id = (body.get("input") or {}).get("requestId") or body.get("requestId")
+    payload = body.model_dump(mode="python")
+    request_id = body.input.requestId or body.requestId
     try:
-        result = await run_classify(body)
+        result = await run_classify(payload)
         return result
     except Exception as e:
         log_event(

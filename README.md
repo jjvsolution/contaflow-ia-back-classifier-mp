@@ -10,6 +10,10 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M01-019 — validación Pydantic `/v1/classify`
+
+Body tipado con `LlmRequest` / `ClassificationInput` (`app/llm_schemas.py`), alineado a `llm.types.ts`. Payload inválido → **422** con `detail` (loc/msg). Evidencia: `python -m unittest tests.test_classify_validation_m01_019`.
+
 ### M01-024 — upsert RAG por sourceId
 
 `POST /v1/learn` hace upsert por `(tenantId, scope, sourceType, sourceId)`: el segundo learn del mismo documento **actualiza** embedding/payload y no duplica filas. Respuesta: `{ ok, id, updated }`. Índice único parcial en migración Prisma. Evidencia: `python -m unittest tests.test_upsert_rag_m01_024`.
