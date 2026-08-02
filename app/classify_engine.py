@@ -206,6 +206,28 @@ def user_payload(inp: dict, wants_entry: bool) -> str:
     return json.dumps(body, ensure_ascii=False)
 
 
+def parse_confidence(value: Any, default: float = 0.65) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        nested = value.get("value")
+        if isinstance(nested, (int, float)):
+            return float(nested)
+        if isinstance(nested, str):
+            try:
+                return float(nested.strip())
+            except ValueError:
+                return default
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
 def parse_amount(value: Any) -> float:
     if value is None:
         return 0.0
@@ -497,7 +519,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    conf_val = float(raw.get("confidence") or 0.65)
+    conf_val = parse_confidence(raw.get("confidence"), 0.65)
     conf_val = max(0.0, min(1.0, conf_val))
     conf_label = (
         "high" if conf_val >= 0.8 else "medium" if conf_val >= 0.55 else "low"
@@ -546,6 +568,8 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(lines_raw, list) and lines_raw:
             lines = []
             for row in lines_raw:
+                if not isinstance(row, dict):
+                    continue
                 acc_name = str(
                     row.get("accountId")
                     or row.get("accountCode")
@@ -554,24 +578,38 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
                 ).strip()
                 ref = pick_chart_ref(acc_name, chart)
                 line: dict[str, Any] = {"account": ref}
-                if row.get("debit"):
+                debit_raw = row.get("debit")
+                credit_raw = row.get("credit")
+                if isinstance(debit_raw, dict):
+                    debit_amt = debit_raw.get("amount")
+                else:
+                    debit_amt = debit_raw
+                if isinstance(credit_raw, dict):
+                    credit_amt = credit_raw.get("amount")
+                else:
+                    credit_amt = credit_raw
+                if debit_amt not in (None, "", 0, "0"):
                     line["debit"] = {
-                        "amount": str(row["debit"]).replace(",", ""),
+                        "amount": str(debit_amt).replace(",", ""),
                         "currency": "CLP",
                     }
-                if row.get("credit"):
+                if credit_amt not in (None, "", 0, "0"):
                     line["credit"] = {
-                        "amount": str(row["credit"]).replace(",", ""),
+                        "amount": str(credit_amt).replace(",", ""),
                         "currency": "CLP",
                     }
                 if row.get("memo"):
                     line["memo"] = row["memo"]
                 lines.append(line)
-            deb = sum(parse_amount(l.get("debit", {}).get("amount", 0)) for l in lines)
-            cre = sum(parse_amount(l.get("credit", {}).get("amount", 0)) for l in lines)
+            deb = sum(
+                parse_amount((l.get("debit") or {}).get("amount", 0)) for l in lines
+            )
+            cre = sum(
+                parse_amount((l.get("credit") or {}).get("amount", 0)) for l in lines
+            )
             has_amounts = any(
-                parse_amount(l.get("debit", {}).get("amount", 0)) > 0
-                or parse_amount(l.get("credit", {}).get("amount", 0)) > 0
+                parse_amount((l.get("debit") or {}).get("amount", 0)) > 0
+                or parse_amount((l.get("credit") or {}).get("amount", 0)) > 0
                 for l in lines
             )
             balanced = has_amounts and abs(deb - cre) < 0.02
@@ -584,7 +622,9 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
                 "entry": {
                     "date": (
                         (inp.get("structured") or {}).get("issueDate")
-                        or (inp.get("structured") or {}).get("bank", {}).get("postedDate")
+                        or ((inp.get("structured") or {}).get("bank") or {}).get(
+                            "postedDate"
+                        )
                         or ""
                     ),
                     "description": f"Sugerencia IA local ({kind})",

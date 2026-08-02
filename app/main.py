@@ -85,8 +85,10 @@ async def classify_v1(
             latencyMs=int((time.perf_counter() - t0) * 1000),
             error=str(e),
         )
-        raise
-
+        raise HTTPException(
+            status_code=500,
+            detail=f"classify failed: {e!s}",
+        ) from e
 
 @app.post("/v1/learn")
 async def learn_v1(
