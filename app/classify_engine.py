@@ -232,13 +232,17 @@ def parse_amount(value: Any) -> float:
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     text = str(value).strip()
     if not text:
         return 0.0
 
     # Accept values returned by the model like "2500", "2.500", "2500 CLP".
+    # Evita basura tipo "4.1-" (código de cuenta truncado / JSON incompleto).
     normalized = re.sub(r"[^0-9,.\-]", "", text)
     if not normalized:
         return 0.0
@@ -248,7 +252,18 @@ def parse_amount(value: Any) -> float:
     elif "," in normalized:
         normalized = normalized.replace(",", ".")
 
-    return float(normalized)
+    # Signo solo al inicio; quitar guiones/puntos colgantes al final.
+    sign = "-" if normalized.startswith("-") else ""
+    body = normalized[1:] if sign else normalized
+    body = re.sub(r"-", "", body).rstrip(".")
+    if not body or body == ".":
+        return 0.0
+    normalized = f"{sign}{body}"
+
+    try:
+        return float(normalized)
+    except ValueError:
+        return 0.0
 
 
 def extract_counterparty(input_text: str) -> str | None:
