@@ -10,6 +10,16 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M01-026 — OCR facturas PDF/imagen
+
+`POST /v1/ocr` (multipart `file`): PDF digital vía **pypdf**; PDF escaneado/imagen vía **Tesseract** (`spa+eng`, Poppler en Docker). Respuesta con `text`, `engine` y `fields` (`rut`, `folio`, `issueDate`, `amountNet`/`amountVat`/`totalAmount`). Evidencia: `python -m unittest tests.test_ocr_m01_026`.
+
+Uso desde la app: el backend expone `POST /uploads/documents/ocr/preview` (JWT) que reenvía a este endpoint y mapea a campos de formulario (M20-004).
+
+```
+curl -s -X POST http://localhost:8000/v1/ocr -F "file=@factura.pdf"
+```
+
 ### M01-019 — validación Pydantic `/v1/classify`
 
 Body tipado con `LlmRequest` / `ClassificationInput` (`app/llm_schemas.py`), alineado a `llm.types.ts`. Payload inválido → **422** con `detail` (loc/msg). Evidencia: `python -m unittest tests.test_classify_validation_m01_019`.

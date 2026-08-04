@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 from pydantic import BaseModel
 
 from app import ollama_client
@@ -12,6 +12,7 @@ from app.db import upsert_example
 from app.input_text import build_input_text
 from app.llm_schemas import LlmRequest
 from app.logging_setup import configure_logging, log_event
+from app.ocr_service import run_ocr
 from app.readiness import composite_ready_check
 
 configure_logging()
@@ -89,6 +90,38 @@ async def classify_v1(
             status_code=500,
             detail=f"classify failed: {e!s}",
         ) from e
+
+@app.post("/v1/ocr")
+async def ocr_v1(
+    _: Annotated[None, Depends(verify_internal)],
+    file: UploadFile = File(..., description="PDF o imagen de factura/boleta"),
+):
+    """M01-026: extrae texto y campos (RUT, folio, montos, fecha) de PDF/imagen."""
+    t0 = time.perf_counter()
+    data = await file.read()
+    max_bytes = 25 * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail="Archivo supera 25 MB.")
+    if not data:
+        raise HTTPException(status_code=400, detail="Archivo vacío.")
+
+    result = run_ocr(
+        filename=file.filename or "upload.bin",
+        content_type=file.content_type,
+        data=data,
+    )
+    log_event(
+        logger,
+        "ocr_done",
+        filename=file.filename,
+        engine=result.get("engine"),
+        pageCount=result.get("pageCount"),
+        hasRut=bool((result.get("fields") or {}).get("rut")),
+        hasFolio=bool((result.get("fields") or {}).get("folio")),
+        latencyMs=int((time.perf_counter() - t0) * 1000),
+    )
+    return result
+
 
 @app.post("/v1/learn")
 async def learn_v1(
