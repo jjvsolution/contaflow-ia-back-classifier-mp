@@ -13,6 +13,7 @@ from app.input_text import build_input_text
 from app.llm_schemas import LlmRequest
 from app.logging_setup import configure_logging, log_event
 from app.ocr_service import run_ocr
+from app.reconcile_matches import ReconcileMatchesRequest, suggest_reconcile_matches
 from app.readiness import composite_ready_check
 
 configure_logging()
@@ -90,6 +91,30 @@ async def classify_v1(
             status_code=500,
             detail=f"classify failed: {e!s}",
         ) from e
+
+@app.post("/v1/reconcile-matches")
+async def reconcile_matches_v1(
+    body: ReconcileMatchesRequest,
+    _: Annotated[None, Depends(verify_internal)],
+):
+    """M13-009: propone pares cartola↔asiento entre unmatched (aprobación humana en ContaFlow)."""
+    t0 = time.perf_counter()
+    matches = suggest_reconcile_matches(body)
+    log_event(
+        logger,
+        "reconcile_matches_done",
+        bank=len(body.unmatchedBank),
+        journal=len(body.unmatchedJournal),
+        suggested=len(matches),
+        latencyMs=int((time.perf_counter() - t0) * 1000),
+    )
+    return {
+        "ok": True,
+        "matches": matches,
+        "requiresHumanApproval": True,
+        "provider": {"type": "local", "model": "reconcile-sim-v1"},
+    }
+
 
 @app.post("/v1/ocr")
 async def ocr_v1(
