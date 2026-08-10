@@ -11,6 +11,7 @@ LlmPurpose = Literal[
     "classify_fee",
     "classify_bank_line",
     "suggest_journal_entry",
+    "suggest_adjustment",
 ]
 LanguageHint = Literal["es", "en"]
 ClassifyMode = Literal["suggest", "classify_only"]

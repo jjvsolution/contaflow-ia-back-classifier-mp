@@ -95,6 +95,7 @@ def resolve_purpose(body: dict[str, Any], kind: str) -> str:
         "classify_fee",
         "classify_bank_line",
         "suggest_journal_entry",
+        "suggest_adjustment",
     }
     if raw in allowed:
         return raw
@@ -136,6 +137,13 @@ PURPOSE_PROMPT_VARIANTS: dict[str, str] = {
         "Las journalLines son obligatorias, balanceadas, con cuentas del plan, "
         "y memos útiles. La categoría/taxTreatment deben alinear con el asiento propuesto."
     ),
+    "suggest_adjustment": (
+        "PURPOSE=suggest_adjustment. Sugiere cuentas DEBE y HABER para un AJUSTE contable "
+        "(depreciación, amortización o provisión). "
+        "Típico: Gasto Depreciación / Depreciación Acumulada; Gasto Amortización / Amortización Acumulada; "
+        "Gasto Provisión / Provisión. Devuelve suggestedEntry con 2 líneas balanceadas del plan. "
+        "Solo sugerencia; requiere aprobación humana."
+    ),
 }
 
 
@@ -170,8 +178,8 @@ def build_system_prompt(
             )
         ex_txt = "\n\n".join(blocks)
 
-    # suggest_journal_entry siempre pide asiento; el resto respeta wants_entry.
-    force_entry = purpose == "suggest_journal_entry"
+    # suggest_journal_entry / suggest_adjustment siempre pide asiento; el resto respeta wants_entry.
+    force_entry = purpose in ("suggest_journal_entry", "suggest_adjustment")
     if force_entry or wants_entry:
         entry_instr = (
             "Incluye journalLines: lista de líneas con accountName, debit (string o vacío), "
