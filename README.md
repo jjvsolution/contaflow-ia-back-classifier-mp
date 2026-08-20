@@ -14,6 +14,10 @@ curl -s http://localhost:11434/api/tags
 
 `POST /v1/reconcile-matches`: recibe unmatched cartola/asientos y propone pares (`matchType=ai`, confianza). ContaFlow exige aprobación humana. Evidencia: `tests/test_reconcile_matches_m13_009.py`.
 
+### M01-027 — chat contable conversacional
+
+`POST /v1/chat`: historial + contexto empresa/período/plan + RAG. Responde JSON (`reply` ES-CL, `citedAccounts`, `suggestedEntry` opcional). Siempre `requiresHumanApproval=true` y `registeredJournalEntry=false` (nunca postea asientos). Evidencia: `python -m pytest tests/test_chat_m01_027.py`.
+
 ### M01-026 — OCR facturas PDF/imagen
 
 `POST /v1/ocr` (multipart `file`): PDF digital vía **pypdf**; PDF escaneado/imagen vía **Tesseract** (`spa+eng`, Poppler en Docker). Respuesta con `text`, `engine` y `fields` (`rut`, `folio`, `issueDate`, `amountNet`/`amountVat`/`totalAmount`). Evidencia: `python -m unittest tests.test_ocr_m01_026`.

@@ -6,6 +6,8 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, Upl
 from pydantic import BaseModel
 
 from app import ollama_client
+from app.chat_engine import run_chat
+from app.chat_schemas import ChatRequest
 from app.classify_engine import normalize_giro, run_classify
 from app.config import settings
 from app.db import upsert_example
@@ -91,6 +93,37 @@ async def classify_v1(
             status_code=500,
             detail=f"classify failed: {e!s}",
         ) from e
+
+
+@app.post("/v1/chat")
+async def chat_v1(
+    body: ChatRequest,
+    _: Annotated[None, Depends(verify_internal)],
+):
+    """M01-027 / E20-005: chat contable ES-CL con historial + RAG; nunca registra asientos."""
+    t0 = time.perf_counter()
+    payload = body.model_dump(mode="python")
+    request_id = body.requestId
+    try:
+        result = await run_chat(payload)
+        # Defensa en profundidad: el motor ya fija estos flags.
+        result["requiresHumanApproval"] = True
+        result["registeredJournalEntry"] = False
+        return result
+    except Exception as e:
+        log_event(
+            logger,
+            "chat_unhandled",
+            level=logging.ERROR,
+            requestId=request_id,
+            latencyMs=int((time.perf_counter() - t0) * 1000),
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"chat failed: {e!s}",
+        ) from e
+
 
 @app.post("/v1/reconcile-matches")
 async def reconcile_matches_v1(
