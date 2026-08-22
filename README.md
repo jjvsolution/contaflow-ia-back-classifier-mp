@@ -14,6 +14,10 @@ curl -s http://localhost:11434/api/tags
 
 `POST /v1/reconcile-matches`: recibe unmatched cartola/asientos y propone pares (`matchType=ai`, confianza). ContaFlow exige aprobación humana. Evidencia: `tests/test_reconcile_matches_m13_009.py`.
 
+### M01-028 — IVA chilena (prompt + post-proceso)
+
+`build_system_prompt` incluye reglas explícitas (19%, `vat_affected` / `vat_exempt`, activo fijo). Tras el modelo, `apply_chilean_vat_postprocess` normaliza `taxTreatment`/`category`/cuenta 1.2.x. Criterio: compra de activo fijo → `vat_affected` (crédito fiscal). Evidencia: `python -m unittest tests.test_chile_vat_m01_028`.
+
 ### M01-027 — chat contable conversacional
 
 `POST /v1/chat`: historial + contexto empresa/período/plan + RAG. Responde JSON (`reply` ES-CL, `citedAccounts`, `suggestedEntry` opcional). Siempre `requiresHumanApproval=true` y `registeredJournalEntry=false` (nunca postea asientos). Evidencia: `python -m pytest tests/test_chat_m01_027.py`.

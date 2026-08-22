@@ -110,16 +110,35 @@ def resolve_purpose(body: dict[str, Any], kind: str) -> str:
     return "classify_purchase"
 
 
+# M01-028: reglas IVA Chile explícitas en el system prompt.
+CHILE_VAT_PROMPT_RULES = (
+    "REGLAS IVA CHILE (obligatorias):\n"
+    "- Tasa general típica: 19% (vatTypicalRate del contexto si viene informado).\n"
+    "- taxTreatment=vat_affected: operación afecta a IVA (crédito fiscal en compras; "
+    "débito fiscal en ventas). Usa cuando haya IVA, factura afecta o tasa 19%.\n"
+    "- taxTreatment=vat_exempt: operación exenta o no afecta (factura/boleta exenta, "
+    "sin IVA, IVA 0%). No inventes IVA.\n"
+    "- taxTreatment=unknown: solo si no hay indicios claros de afecto/exento.\n"
+    "- COMPRA DE ACTIVO FIJO (maquinaria, equipos, notebook/computador, vehículos, "
+    "muebles y útiles, inmuebles, PPE, cuentas 1.2.x): categoría fixed_asset (o similar); "
+    "cuenta de activo fijo (1.2.x), NO gasto corriente 5.x; si es factura afecta → "
+    "taxTreatment=vat_affected (crédito fiscal IVA del activo). "
+    "No trates activo fijo afecto como vat_exempt."
+)
+
 PURPOSE_PROMPT_VARIANTS: dict[str, str] = {
     "classify_purchase": (
         "PURPOSE=classify_purchase. Clasifica una COMPRA / factura de proveedor. "
-        "Prioriza gasto o costo (cuentas 5.x), IVA crédito fiscal cuando aplique (vat_affected), "
-        "y pasivos/proveedores si el contexto es deuda. Distingue activo fijo vs gasto corriente."
+        "Prioriza gasto o costo (cuentas 5.x) salvo activo fijo (1.2.x), "
+        "IVA crédito fiscal cuando aplique (vat_affected), "
+        "y pasivos/proveedores si el contexto es deuda. "
+        "Distingue activo fijo vs gasto corriente; activo fijo afecto → vat_affected."
     ),
     "classify_sale": (
         "PURPOSE=classify_sale. Clasifica una VENTA / factura a cliente. "
-        "Prioriza ingresos (cuentas 4.x), IVA débito fiscal cuando aplique, "
-        "y clientes/caja según el cobro. No uses cuentas de gasto de compra."
+        "Prioriza ingresos (cuentas 4.x), IVA débito fiscal cuando aplique (vat_affected), "
+        "y clientes/caja según el cobro. No uses cuentas de gasto de compra. "
+        "Venta exenta → vat_exempt."
     ),
     "classify_fee": (
         "PURPOSE=classify_fee. Clasifica una BOLETA DE HONORARIOS (prestador de servicio). "
@@ -130,21 +149,221 @@ PURPOSE_PROMPT_VARIANTS: dict[str, str] = {
         "PURPOSE=classify_bank_line. Clasifica un MOVIMIENTO DE CARTOLA BANCARIA. "
         "Monto negativo ≈ egreso/cargo; positivo ≈ ingreso/abono. "
         "Sugiere cuenta bancaria (1.1) y contrapartida (gasto/ingreso/pasivo) según la glosa. "
-        "Evita clasificar como factura de compra/venta salvo evidencia clara."
+        "Evita clasificar como factura de compra/venta salvo evidencia clara. "
+        "taxTreatment suele ser unknown salvo glosa con IVA explícito."
     ),
     "suggest_journal_entry": (
         "PURPOSE=suggest_journal_entry. El foco es el ASIENTO contable (debe/haber) en CLP. "
         "Las journalLines son obligatorias, balanceadas, con cuentas del plan, "
-        "y memos útiles. La categoría/taxTreatment deben alinear con el asiento propuesto."
+        "y memos útiles. La categoría/taxTreatment deben alinear con el asiento propuesto "
+        "(incl. IVA 19% / crédito-débito fiscal si aplica)."
     ),
     "suggest_adjustment": (
         "PURPOSE=suggest_adjustment. Sugiere cuentas DEBE y HABER para un AJUSTE contable "
         "(depreciación, amortización o provisión). "
         "Típico: Gasto Depreciación / Depreciación Acumulada; Gasto Amortización / Amortización Acumulada; "
         "Gasto Provisión / Provisión. Devuelve suggestedEntry con 2 líneas balanceadas del plan. "
-        "Solo sugerencia; requiere aprobación humana."
+        "Solo sugerencia; requiere aprobación humana. taxTreatment=unknown salvo indicación explícita."
     ),
 }
+
+_FIXED_ASSET_RE = re.compile(
+    r"activo\s*fijo|fixed[_\s-]?asset|\bppe\b|"
+    r"maquinaria|equipos?(?:\s+computacional)?|notebook|laptop|computador(?:es)?|"
+    r"impresora|servidor|hardware|"
+    r"veh[ií]culo|camioneta|\bauto\b|\bcami[oó]n\b|"
+    r"muebles?\s+y\s+[uú]tiles|mobiliario|herramientas?|"
+    r"inmueble|edificio|construcci[oó]n|terreno|"
+    r"1\.2\.\d+",
+    re.IGNORECASE,
+)
+_EXEMPT_RE = re.compile(
+    r"\bexent[oa]s?\b|\bsin\s+iva\b|\biva\s*0(?:\s*%|\s*por\s*ciento)?\b|"
+    r"\bno\s+afect[oa]\b|factura\s+exenta|boleta\s+exenta|neto\s+exento",
+    re.IGNORECASE,
+)
+_VAT_AFFECTED_RE = re.compile(
+    r"(?<!sin\s)\biva\b|\b19\s*%|\bafect[oa]s?\b|cr[eé]dito\s+fiscal|d[eé]bito\s+fiscal|"
+    r"factura\s+afecta|vat_affected",
+    re.IGNORECASE,
+)
+_FIXED_ASSET_CATEGORY_RE = re.compile(
+    r"fixed_?asset|activo_?fijo|ppe|capital_?asset|property_plant",
+    re.IGNORECASE,
+)
+
+
+def resolve_vat_typical_rate(inp: dict[str, Any] | None) -> float:
+    """Tasa IVA típica Chile; usa accountingContext.rules.vatTypicalRate si viene."""
+    rules = ((inp or {}).get("accountingContext") or {}).get("rules") or {}
+    raw = rules.get("vatTypicalRate")
+    if isinstance(raw, (int, float)) and float(raw) > 0:
+        rate = float(raw)
+        # Acepta 0.19 o 19
+        return rate / 100.0 if rate > 1 else rate
+    return 0.19
+
+
+def looks_like_fixed_asset(
+    *,
+    text: str,
+    category: str,
+    primary_name: str,
+) -> bool:
+    blob = f"{text}\n{category}\n{primary_name}"
+    if _FIXED_ASSET_CATEGORY_RE.search(str(category or "")):
+        return True
+    if _FIXED_ASSET_RE.search(blob):
+        return True
+    code_m = re.search(r"\b(1\.2(?:\.\d+)*)\b", primary_name or "")
+    return bool(code_m)
+
+
+def prefer_fixed_asset_account(
+    primary_name: str,
+    chart: list[dict] | None,
+    *,
+    text: str,
+) -> str:
+    """Si es activo fijo y el modelo eligió gasto 5.x, prefiere cuenta 1.2 del plan."""
+    if not chart:
+        return primary_name
+    current = pick_chart_ref(primary_name, chart)
+    code = str(current.get("code") or "")
+    if code.startswith("1.2"):
+        return primary_name
+
+    text_l = (text or "").lower()
+    scored: list[tuple[int, dict]] = []
+    for a in chart:
+        acc_code = str(a.get("code") or "")
+        if not acc_code.startswith("1.2") or not a.get("name"):
+            continue
+        name_l = str(a.get("name") or "").lower()
+        score = 0
+        for token in (
+            "notebook",
+            "computador",
+            "maquinaria",
+            "equipo",
+            "mueble",
+            "vehiculo",
+            "vehículo",
+            "camioneta",
+            "herramienta",
+            "edificio",
+            "terreno",
+            "impresora",
+            "servidor",
+        ):
+            if token in text_l and token in name_l:
+                score += 3
+            elif token in text_l and token[:5] in name_l:
+                score += 1
+        if "activo" in name_l or "equipo" in name_l or "mueble" in name_l:
+            score += 1
+        if score:
+            scored.append((score, a))
+
+    if not scored:
+        # Cualquier posting 1.2.01.* como fallback suave
+        for a in chart:
+            acc_code = str(a.get("code") or "")
+            if acc_code.startswith("1.2.01") and a.get("name"):
+                scored.append((1, a))
+                break
+
+    if not scored:
+        return primary_name
+
+    scored.sort(key=lambda x: (-x[0], str(x[1].get("code") or "")))
+    best = scored[0][1]
+    code_b = str(best.get("code") or "").strip()
+    name_b = str(best.get("name") or "").strip()
+    return f"{code_b} - {name_b}" if code_b else name_b
+
+
+def apply_chilean_vat_postprocess(
+    *,
+    category: str,
+    tax_treatment: str,
+    primary_name: str,
+    inp: dict[str, Any],
+    purpose: str,
+    chart: list[dict] | None,
+) -> tuple[str, str, str, list[str]]:
+    """
+    M01-028: normaliza taxTreatment/categoría/cuenta con reglas IVA Chile.
+    Retorna (category, taxTreatment, primaryAccountName, warnings).
+    """
+    warnings: list[str] = []
+    tax = tax_treatment if tax_treatment in ("vat_affected", "vat_exempt", "unknown") else "unknown"
+    cat = (category or "general").strip() or "general"
+    primary = (primary_name or "").strip() or "Gastos generales"
+
+    text = build_input_text(inp)
+    kind = str(inp.get("kind") or "")
+    is_purchase = purpose == "classify_purchase" or kind == "purchase"
+    is_sale = purpose == "classify_sale" or kind == "sale"
+    is_fee = purpose == "classify_fee" or kind == "fee"
+
+    structured = inp.get("structured") or {}
+    totals = structured.get("totals") or {}
+    tax_amt = parse_amount((totals.get("tax") or {}).get("amount"))
+    exempt_amt = parse_amount((totals.get("exempt") or {}).get("amount"))
+    net_amt = parse_amount((totals.get("net") or {}).get("amount"))
+
+    rate = resolve_vat_typical_rate(inp)
+    rate_pct = int(round(rate * 100)) if abs(rate * 100 - round(rate * 100)) < 1e-9 else round(rate * 100, 2)
+
+    exempt_signal = bool(_EXEMPT_RE.search(text)) or (
+        exempt_amt > 0 and tax_amt <= 0 and net_amt > 0
+    )
+    affected_signal = (tax_amt > 0) or (
+        bool(_VAT_AFFECTED_RE.search(text)) and not exempt_signal
+    )
+    # Neto+total con diferencia ~19% → afecto
+    total_amt = parse_amount((totals.get("total") or {}).get("amount"))
+    if net_amt > 0 and total_amt > net_amt and tax_amt <= 0:
+        implied = (total_amt - net_amt) / net_amt
+        if abs(implied - rate) < 0.03:
+            affected_signal = True
+
+    is_fa = looks_like_fixed_asset(text=text, category=cat, primary_name=primary)
+
+    if is_fee and tax == "vat_affected" and not affected_signal:
+        tax = "vat_exempt" if exempt_signal else "unknown"
+        warnings.append("Honorarios: taxTreatment ajustado (sin señal clara de IVA).")
+
+    if exempt_signal and not affected_signal:
+        if tax != "vat_exempt":
+            tax = "vat_exempt"
+            warnings.append("Señal de operación exenta → taxTreatment=vat_exempt.")
+    elif affected_signal:
+        if tax != "vat_affected":
+            tax = "vat_affected"
+            warnings.append(f"Señal de IVA (~{rate_pct}%) → taxTreatment=vat_affected.")
+    elif is_purchase and is_fa and tax in ("unknown", "vat_exempt"):
+        # Criterio M01-028: compra activo fijo afecta sugiere IVA crédito (19%).
+        if not exempt_signal:
+            tax = "vat_affected"
+            warnings.append(
+                f"Compra de activo fijo: taxTreatment=vat_affected (IVA Chile ~{rate_pct}%, crédito fiscal)."
+            )
+
+    if is_purchase and is_fa:
+        if not _FIXED_ASSET_CATEGORY_RE.search(cat):
+            cat = "fixed_asset"
+            warnings.append("Categoría normalizada a fixed_asset (compra de activo fijo).")
+        new_primary = prefer_fixed_asset_account(primary, chart, text=text)
+        if new_primary != primary:
+            primary = new_primary
+            warnings.append("Cuenta preferida de activo fijo (1.2.x) sobre gasto corriente.")
+
+    if is_sale and exempt_signal and not affected_signal:
+        tax = "vat_exempt"
+
+    return cat, tax, primary, warnings
 
 
 def build_system_prompt(
@@ -152,6 +371,7 @@ def build_system_prompt(
     examples: list[dict],
     wants_entry: bool,
     purpose: str = "classify_purchase",
+    vat_typical_rate: float = 0.19,
 ) -> str:
     chart_txt = ""
     if chart:
@@ -194,12 +414,20 @@ def build_system_prompt(
         PURPOSE_PROMPT_VARIANTS["classify_purchase"],
     )
 
+    rate_pct = (
+        int(round(vat_typical_rate * 100))
+        if abs(vat_typical_rate * 100 - round(vat_typical_rate * 100)) < 1e-9
+        else round(vat_typical_rate * 100, 2)
+    )
+    vat_rate_line = f"vatTypicalRate vigente en este request: {rate_pct}%.\n"
+
     return (
         "Eres un asistente contable para Chile (CLP). Responde SOLO JSON válido, sin markdown. "
         "Campos requeridos: category (snake_case corto), taxTreatment (vat_affected|vat_exempt|unknown), "
         "primaryAccountName (nombre exacto, código o 'codigo - nombre' que exista en el plan si es posible), "
         "alternativeAccountNames (array de strings, opcional), confidence (0..1)."
         f"\n\n{purpose_block}"
+        f"\n{vat_rate_line}{CHILE_VAT_PROMPT_RULES}"
         f"\n{entry_instr}\n\n{chart_txt}\n\nEjemplos similares del mismo cliente/giro:\n{ex_txt}"
     )
 
@@ -450,11 +678,16 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
 
     chart = (inp.get("accountingContext") or {}).get("chartOfAccountsTop") or []
     prompt_chart = chart_for_prompt(chart, kind)
+    vat_rate = resolve_vat_typical_rate(inp)
     messages = [
         {
             "role": "system",
             "content": build_system_prompt(
-                prompt_chart, examples, wants_entry, purpose=purpose
+                prompt_chart,
+                examples,
+                wants_entry,
+                purpose=purpose,
+                vat_typical_rate=vat_rate,
             ),
         },
         {"role": "user", "content": user_payload(inp, wants_entry)},
@@ -525,6 +758,14 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         or raw.get("primaryAccountName")
         or "Gastos generales"
     )
+    cat, tax, primary_name, vat_warnings = apply_chilean_vat_postprocess(
+        category=str(cat),
+        tax_treatment=str(tax),
+        primary_name=str(primary_name),
+        inp=inp,
+        purpose=purpose,
+        chart=chart,
+    )
     primary = pick_chart_ref(str(primary_name), chart)
     alts = []
     for i, name in enumerate(raw.get("alternativeAccountNames") or []):
@@ -551,7 +792,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     confidence = {
         "value": conf_val,
         "label": conf_label,
-        "rationaleShort": "Modelo local + RAG",
+        "rationaleShort": "Modelo local + RAG + reglas IVA Chile",
     }
 
     warnings: list[str] = []
@@ -563,6 +804,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         warnings.append(
             "RAG degradado: no hay ejemplos previos para este tenant/giro/tipo."
         )
+    warnings.extend(vat_warnings)
 
     result: dict[str, Any] = {
         "requestId": request_id,
@@ -573,7 +815,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         "provider": {
             "type": "local",
             "model": settings.ollama_chat_model,
-            "promptVersion": "rag-v1",
+            "promptVersion": "rag-v1-cl-vat",
             "latencyMs": latency,
         },
         "classification": {"category": cat, "taxTreatment": tax},
