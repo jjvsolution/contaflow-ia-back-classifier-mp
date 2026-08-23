@@ -10,6 +10,10 @@ Luego valida que ya aparecen:
 curl -s http://localhost:11434/api/tags
 ```
 
+### M24-006 — tests core sin Ollama real
+
+`tests/test_m24_006_helpers_classify.py`: `pick_chart_ref`, `build_input_text`, salvage/`_parse_model_json`, y `run_classify` con Ollama mock (≥15 tests). Evidencia: `python -m pytest tests/test_m24_006_helpers_classify.py`.
+
 ### M13-009 — sugerencias matches conciliación
 
 `POST /v1/reconcile-matches`: recibe unmatched cartola/asientos y propone pares (`matchType=ai`, confianza). ContaFlow exige aprobación humana. Evidencia: `tests/test_reconcile_matches_m13_009.py`.
