@@ -73,3 +73,7 @@ cd "c:/Users/josep/Documents/UNAB/PROYECTO DE TITULO/workspace/app-contaflow-ia"
 
 # Solo IA (tiene el /ready de Ollama + modelos)
 docker compose up -d --build ai-api
+
+curl https://unemployed-caprice-jjvsolutions-7f31f51a.koyeb.app/api/pull -d '{"name":"llama3.2:latest"}'
+
+curl https://unemployed-caprice-jjvsolutions-7f31f51a.koyeb.app/api/pull -d '{"name":"nomic-embed-text:latest"}'

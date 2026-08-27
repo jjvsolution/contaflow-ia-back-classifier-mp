@@ -1,15 +1,58 @@
 from contextlib import contextmanager
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.config import settings
 
+# Prisma acepta query params que libpq/psycopg rechazan (p. ej. ?schema=public).
+_PRISMA_ONLY_QUERY_PARAMS = frozenset(
+    {
+        "schema",
+        "connection_limit",
+        "pool_timeout",
+        "pgbouncer",
+        "socket_timeout",
+        "statement_cache_size",
+    }
+)
+# Tablas Prisma viven en @@schema("contaflow"), no en public.
+_DEFAULT_SEARCH_PATH = ("contaflow", "public")
+
+
+def conninfo_from_database_url(database_url: str) -> tuple[str, tuple[str, ...]]:
+    """Quita params de Prisma y deriva search_path para psycopg."""
+    raw = database_url.strip().strip('"').strip("'")
+    parsed = urlparse(raw)
+    kept: list[tuple[str, str]] = []
+    prisma_schema: str | None = None
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered == "schema":
+            prisma_schema = value.strip() or None
+            continue
+        if lowered in _PRISMA_ONLY_QUERY_PARAMS:
+            continue
+        kept.append((key, value))
+    conninfo = urlunparse(parsed._replace(query=urlencode(kept)))
+    search_path = list(_DEFAULT_SEARCH_PATH)
+    if prisma_schema and prisma_schema not in search_path:
+        search_path.insert(0, prisma_schema)
+    return conninfo, tuple(search_path)
+
 
 @contextmanager
 def get_conn():
-    with psycopg.connect(settings.database_url) as conn:
+    conninfo, search_path = conninfo_from_database_url(settings.database_url)
+    with psycopg.connect(conninfo) as conn:
+        conn.execute(
+            sql.SQL("SET search_path TO {}").format(
+                sql.SQL(", ").join(sql.Identifier(name) for name in search_path)
+            )
+        )
         yield conn
 
 

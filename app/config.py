@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # Puede ser la misma URL de Prisma (?schema=contaflow). db.py la sanitiza para psycopg.
     database_url: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/contaflow",
         validation_alias="DATABASE_URL",
