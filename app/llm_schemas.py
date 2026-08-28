@@ -46,6 +46,7 @@ class ChartAccountRef(_StrictIgnore):
     name: str
     accountId: str | None = None
     code: str | None = None
+    type: str | None = None
     normalBalance: NormalBalance | None = None
 
 

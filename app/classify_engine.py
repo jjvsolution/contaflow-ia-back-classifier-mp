@@ -376,7 +376,7 @@ def build_system_prompt(
     chart_txt = ""
     if chart:
         lines = []
-        for a in chart[:80]:
+        for a in chart:
             code = a.get("code") or ""
             nm = a.get("name") or ""
             lines.append(f"- {code} {nm}".strip())
@@ -524,27 +524,44 @@ def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict
     return sorted(examples, key=score, reverse=True)
 
 
-def chart_for_prompt(chart: list[dict], kind: str, limit: int = 60) -> list[dict]:
+CHART_PROMPT_LIMIT = 80
+
+_PURCHASE_ACCOUNT_TYPES = frozenset({"ASSET", "EXPENSE"})
+_SALE_ACCOUNT_TYPES = frozenset({"INCOME"})
+_FEE_ACCOUNT_TYPES = frozenset({"EXPENSE"})
+
+
+def account_matches_classify_kind(account: dict, kind: str) -> bool:
+    """Filtra cuentas del prompt según tipo de documento (plan Chile + AccountType)."""
+    code = str(account.get("code") or "").strip()
+    acc_type = str(account.get("type") or "").upper().strip()
+
+    if kind == "purchase":
+        if acc_type in _PURCHASE_ACCOUNT_TYPES:
+            return True
+        return code.startswith(("1.", "5."))
+    if kind == "sale":
+        if acc_type in _SALE_ACCOUNT_TYPES:
+            return True
+        return code.startswith("4.")
+    if kind == "fee":
+        if acc_type in _FEE_ACCOUNT_TYPES:
+            return True
+        return code.startswith("5.")
+    if kind == "bank_statement_line":
+        return code.startswith(("1.", "2.", "5."))
+    return True
+
+
+def chart_for_prompt(
+    chart: list[dict],
+    kind: str,
+    limit: int = CHART_PROMPT_LIMIT,
+) -> list[dict]:
     if not chart:
         return []
-
-    code_prefixes: tuple[str, ...]
-    if kind == "purchase":
-        code_prefixes = ("5.", "2.1", "1.1", "1.2")
-    elif kind == "sale":
-        code_prefixes = ("4.", "1.1", "2.1")
-    elif kind == "fee":
-        code_prefixes = ("5.", "2.1")
-    else:
-        code_prefixes = ("5.", "4.", "2.1", "1.1")
-
-    filtered = [
-        a
-        for a in chart
-        if str(a.get("code") or "").startswith(code_prefixes)
-    ]
-    pool = filtered if len(filtered) >= 15 else chart
-    return pool[:limit]
+    filtered = [a for a in chart if account_matches_classify_kind(a, kind)]
+    return filtered[:limit]
 
 
 def is_valid_classification(raw: dict[str, Any]) -> bool:
