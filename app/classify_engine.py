@@ -524,7 +524,149 @@ def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict
     return sorted(examples, key=score, reverse=True)
 
 
-CHART_PROMPT_LIMIT = 80
+def _payload_as_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if hasattr(payload, "keys"):
+        return dict(payload)
+    return {}
+
+
+def pick_rag_short_circuit_example(
+    examples: list[dict],
+    input_text: str,
+    *,
+    max_dist: float,
+    max_dist_same_counterparty: float,
+) -> dict | None:
+    """Mejor ejemplo RAG si supera umbral de similitud (y opcionalmente misma contraparte)."""
+    if not examples:
+        return None
+    best = examples[0]
+    dist = float(best.get("dist", 999.0))
+    target_cp = extract_counterparty(input_text)
+    ex_cp = extract_counterparty(str(best.get("inputText") or ""))
+    same_cp = bool(target_cp and ex_cp and target_cp == ex_cp)
+    limit = max_dist_same_counterparty if same_cp else max_dist
+    if dist > limit:
+        return None
+    payload = _payload_as_dict(best.get("payloadJson"))
+    primary = (
+        str(payload.get("primaryAccountId") or "").strip()
+        or str(payload.get("primaryAccountName") or "").strip()
+    )
+    if not primary:
+        return None
+    return best
+
+
+def build_rag_short_circuit_result(
+    *,
+    body: dict[str, Any],
+    request_id: str,
+    inp: dict[str, Any],
+    kind: str,
+    purpose: str,
+    example: dict,
+    examples: list[dict],
+    chart: list[dict],
+    input_text: str,
+    wants_entry: bool,
+    explain: bool,
+    t0: float,
+) -> dict[str, Any]:
+    """Clasificación directa desde payload aprendido (sin ollama_chat)."""
+    payload = _payload_as_dict(example.get("payloadJson"))
+    learned = payload.get("classification")
+    cat = "general"
+    tax = "unknown"
+    if isinstance(learned, dict):
+        cat = str(learned.get("category") or cat)
+        tax = str(learned.get("taxTreatment") or tax)
+    primary_key = (
+        str(payload.get("primaryAccountId") or "").strip()
+        or str(payload.get("primaryAccountName") or "").strip()
+    )
+    if tax not in ("vat_affected", "vat_exempt", "unknown"):
+        tax = "unknown"
+
+    cat, tax, primary_name, vat_warnings = apply_chilean_vat_postprocess(
+        category=cat,
+        tax_treatment=tax,
+        primary_name=primary_key,
+        inp=inp,
+        purpose=purpose,
+        chart=chart,
+    )
+    primary = pick_chart_ref(primary_name, chart)
+    dist = float(example.get("dist", 1.0))
+    conf_val = max(0.78, min(0.97, 0.97 - dist * 0.45))
+    confidence = {
+        "value": conf_val,
+        "label": "high" if conf_val >= 0.8 else "medium",
+        "rationaleShort": "Ejemplo histórico similar (RAG, sin LLM)",
+    }
+
+    period = inp.get("period") or {}
+    period_closed = bool(period.get("isClosed"))
+    warnings = [
+        "Clasificación desde ejemplo histórico (sin LLM).",
+        *vat_warnings,
+    ]
+
+    total_ms = _elapsed_ms(t0)
+    result: dict[str, Any] = {
+        "requestId": request_id,
+        "kind": kind,
+        "outcome": "suggested",
+        "ragStatus": "ok",
+        "ragExamplesUsed": len(examples),
+        "provider": {
+            "type": "local",
+            "model": "rag-short-circuit",
+            "promptVersion": "rag-short-circuit-v1",
+            "latencyMs": total_ms,
+        },
+        "classification": {"category": cat, "taxTreatment": tax},
+        "suggestedAccount": {"primary": primary, "alternatives": None},
+        "confidence": confidence,
+        "previewPolicy": {
+            "requiresHumanApproval": True,
+            "periodIsClosedReadOnly": period_closed,
+        },
+        "warnings": warnings,
+        "suggestedEntry": None,
+    }
+
+    log_event(
+        logger,
+        "classify_rag_short_circuit",
+        requestId=request_id,
+        purpose=purpose,
+        kind=kind,
+        exampleId=example.get("id"),
+        ragDist=round(dist, 4),
+        latencyMs=total_ms,
+        counterparty=extract_counterparty(input_text),
+    )
+    log_event(
+        logger,
+        "classify_done",
+        requestId=request_id,
+        purpose=purpose,
+        kind=kind,
+        outcome="suggested",
+        latencyMs=total_ms,
+        llmLatencyMs=0,
+        ragStatus="ok",
+        ragExamples=len(examples),
+        ragShortCircuit=True,
+        category=cat,
+    )
+    return {"requestId": body.get("requestId") or request_id, "json": result}
+
+
+CHART_PROMPT_LIMIT = 30
 
 _PURCHASE_ACCOUNT_TYPES = frozenset({"ASSET", "EXPENSE"})
 _SALE_ACCOUNT_TYPES = frozenset({"INCOME"})
@@ -694,6 +836,33 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     )
 
     chart = (inp.get("accountingContext") or {}).get("chartOfAccountsTop") or []
+    if (
+        settings.rag_short_circuit_enabled
+        and not rag_failed
+        and examples
+    ):
+        sc_example = pick_rag_short_circuit_example(
+            examples,
+            input_text,
+            max_dist=settings.rag_short_circuit_max_dist,
+            max_dist_same_counterparty=settings.rag_short_circuit_max_dist_same_cp,
+        )
+        if sc_example is not None:
+            return build_rag_short_circuit_result(
+                body=body,
+                request_id=request_id,
+                inp=inp,
+                kind=kind,
+                purpose=purpose,
+                example=sc_example,
+                examples=examples,
+                chart=chart,
+                input_text=input_text,
+                wants_entry=wants_entry,
+                explain=explain,
+                t0=t0,
+            )
+
     prompt_chart = chart_for_prompt(chart, kind)
     vat_rate = resolve_vat_typical_rate(inp)
     messages = [

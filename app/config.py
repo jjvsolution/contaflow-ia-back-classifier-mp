@@ -17,6 +17,16 @@ class Settings(BaseSettings):
     internal_token: str | None = Field(default=None, validation_alias="INTERNAL_TOKEN")
     rag_company_limit: int = Field(default=8, validation_alias="RAG_COMPANY_LIMIT")
     rag_giro_limit: int = Field(default=8, validation_alias="RAG_GIRO_LIMIT")
+    rag_short_circuit_enabled: bool = Field(
+        default=True, validation_alias="RAG_SHORT_CIRCUIT_ENABLED"
+    )
+    # Distancia coseno pgvector (<=>): menor = más parecido. 0 = idéntico.
+    rag_short_circuit_max_dist: float = Field(
+        default=0.22, validation_alias="RAG_SHORT_CIRCUIT_MAX_DIST"
+    )
+    rag_short_circuit_max_dist_same_cp: float = Field(
+        default=0.35, validation_alias="RAG_SHORT_CIRCUIT_MAX_DIST_SAME_CP"
+    )
 
 
 settings = Settings()
