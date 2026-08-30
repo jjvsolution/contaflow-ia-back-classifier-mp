@@ -516,10 +516,17 @@ def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict
     if not target_cp:
         return examples
 
+    def counterparty_score(example_text: str) -> int:
+        txt = example_text.lower()
+        if f"contraparte:{target_cp}" in txt:
+            return 2
+        if target_cp in txt:
+            return 1
+        return 0
+
     def score(ex: dict) -> tuple[int, float]:
         txt = str(ex.get("inputText") or "").lower()
-        same_counterparty = 1 if f"contraparte:{target_cp}" in txt else 0
-        return (same_counterparty, -float(ex.get("dist", 1.0)))
+        return (counterparty_score(txt), -float(ex.get("dist", 1.0)))
 
     return sorted(examples, key=score, reverse=True)
 
@@ -530,6 +537,90 @@ def _payload_as_dict(payload: Any) -> dict[str, Any]:
     if hasattr(payload, "keys"):
         return dict(payload)
     return {}
+
+
+def primary_from_learn_payload(payload: dict[str, Any]) -> str:
+    """Cuenta contrapartida aprendida (compras o cartola confirmada)."""
+    for key in (
+        "primaryAccountId",
+        "primaryAccountName",
+        "counterAccountId",
+        "counterAccountName",
+    ):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def bank_suggested_entry_from_learn_payload(
+    payload: dict[str, Any],
+    inp: dict[str, Any],
+    chart: list[dict],
+) -> dict[str, Any] | None:
+    """Asiento sugerido para cartola desde ejemplo confirmado (orden UI: banco, contrapartida)."""
+    bank_name = str(payload.get("bankAccountName") or "").strip()
+    counter_name = (
+        str(payload.get("counterAccountName") or "").strip()
+        or str(payload.get("primaryAccountName") or "").strip()
+    )
+    if not bank_name or not counter_name:
+        return None
+
+    bank_ref = pick_chart_ref(bank_name, chart)
+    counter_ref = pick_chart_ref(counter_name, chart)
+
+    totals = (inp.get("structured") or {}).get("totals") or {}
+    total = totals.get("total") if isinstance(totals, dict) else {}
+    amount = parse_amount(total.get("amount") if isinstance(total, dict) else None)
+    abs_str = f"{abs(amount):.2f}" if amount else "0.00"
+
+    bank = (inp.get("structured") or {}).get("bank") or {}
+    posted = bank.get("postedDate") or ""
+    memo = bank.get("memo") or (inp.get("source") or {}).get("textRaw") or ""
+
+    if amount < 0:
+        bank_line: dict[str, Any] = {
+            "account": bank_ref,
+            "credit": {"amount": abs_str, "currency": "CLP"},
+            "memo": "Cartola",
+        }
+        counter_line: dict[str, Any] = {
+            "account": counter_ref,
+            "debit": {"amount": abs_str, "currency": "CLP"},
+            "memo": memo,
+        }
+    elif amount > 0:
+        bank_line = {
+            "account": bank_ref,
+            "debit": {"amount": abs_str, "currency": "CLP"},
+            "memo": "Cartola",
+        }
+        counter_line = {
+            "account": counter_ref,
+            "credit": {"amount": abs_str, "currency": "CLP"},
+            "memo": memo,
+        }
+    else:
+        bank_line = {"account": bank_ref, "memo": "Cartola"}
+        counter_line = {"account": counter_ref, "memo": memo}
+
+    return {
+        "entry": {
+            "date": posted or "",
+            "description": "Sugerencia desde ejemplo histórico (cartola)",
+            "lines": [bank_line, counter_line],
+            "isBalanced": bool(amount),
+        },
+        "confidence": {
+            "value": 0.9,
+            "label": "high",
+            "rationaleShort": "Asiento desde confirmación previa similar",
+        },
+        "explanation": {
+            "summary": "Cuentas reutilizadas de un movimiento de cartola confirmado antes.",
+        },
+    }
 
 
 def pick_rag_short_circuit_example(
@@ -551,11 +642,7 @@ def pick_rag_short_circuit_example(
     if dist > limit:
         return None
     payload = _payload_as_dict(best.get("payloadJson"))
-    primary = (
-        str(payload.get("primaryAccountId") or "").strip()
-        or str(payload.get("primaryAccountName") or "").strip()
-    )
-    if not primary:
+    if not primary_from_learn_payload(payload):
         return None
     return best
 
@@ -583,10 +670,7 @@ def build_rag_short_circuit_result(
     if isinstance(learned, dict):
         cat = str(learned.get("category") or cat)
         tax = str(learned.get("taxTreatment") or tax)
-    primary_key = (
-        str(payload.get("primaryAccountId") or "").strip()
-        or str(payload.get("primaryAccountName") or "").strip()
-    )
+    primary_key = primary_from_learn_payload(payload)
     if tax not in ("vat_affected", "vat_exempt", "unknown"):
         tax = "unknown"
 
@@ -637,6 +721,11 @@ def build_rag_short_circuit_result(
         "warnings": warnings,
         "suggestedEntry": None,
     }
+
+    if wants_entry and kind == "bank_statement_line":
+        suggested = bank_suggested_entry_from_learn_payload(payload, inp, chart)
+        if suggested:
+            result["suggestedEntry"] = suggested
 
     log_event(
         logger,
