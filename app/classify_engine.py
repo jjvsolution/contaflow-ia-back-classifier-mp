@@ -511,6 +511,24 @@ def extract_counterparty(input_text: str) -> str | None:
     return None
 
 
+def normalize_counterparty(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def counterparties_match(a: str | None, b: str | None) -> bool:
+    na = normalize_counterparty(a)
+    nb = normalize_counterparty(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if len(na) >= 6 and len(nb) >= 6:
+        return na in nb or nb in na
+    return False
+
+
 def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict]:
     target_cp = extract_counterparty(input_text)
     if not target_cp:
@@ -518,9 +536,12 @@ def rank_examples_for_prompt(examples: list[dict], input_text: str) -> list[dict
 
     def counterparty_score(example_text: str) -> int:
         txt = example_text.lower()
-        if f"contraparte:{target_cp}" in txt:
+        ex_cp = extract_counterparty(txt)
+        if counterparties_match(target_cp, ex_cp):
             return 2
-        if target_cp in txt:
+        if target_cp and f"contraparte:{target_cp}" in txt:
+            return 2
+        if target_cp and target_cp in txt:
             return 1
         return 0
 
@@ -550,7 +571,109 @@ def primary_from_learn_payload(payload: dict[str, Any]) -> str:
         value = str(payload.get(key) or "").strip()
         if value:
             return value
+    lines = payload.get("journalLines") or payload.get("lines")
+    if isinstance(lines, list):
+        for row in lines:
+            if not isinstance(row, dict):
+                continue
+            memo = str(row.get("memo") or "").lower()
+            if memo == "cartola":
+                continue
+            name = str(row.get("accountName") or row.get("accountId") or "").strip()
+            if name:
+                return name
     return ""
+
+
+def bank_accounts_from_learn_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    bank = str(payload.get("bankAccountName") or "").strip()
+    counter = (
+        str(payload.get("counterAccountName") or "").strip()
+        or str(payload.get("primaryAccountName") or "").strip()
+        or primary_from_learn_payload(payload)
+    )
+    if bank and counter:
+        return bank, counter
+
+    lines = payload.get("journalLines") or payload.get("lines")
+    if not isinstance(lines, list):
+        return bank, counter
+
+    bank_name = bank
+    counter_name = counter
+    non_cartola: list[str] = []
+    for row in lines:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("accountName") or row.get("accountId") or "").strip()
+        if not name:
+            continue
+        memo = str(row.get("memo") or "").lower()
+        if memo == "cartola":
+            bank_name = bank_name or name
+        else:
+            non_cartola.append(name)
+
+    if not counter_name and non_cartola:
+        counter_name = non_cartola[0]
+    if not bank_name and len(non_cartola) >= 2:
+        bank_name = non_cartola[-1]
+
+    return bank_name, counter_name
+
+
+def salvage_model_classification(raw: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Completa category/primaryAccountName si el LLM devolvió solo journalLines."""
+    if not raw:
+        return raw
+    out = dict(raw)
+    primary = str(
+        out.get("primaryAccountId") or out.get("primaryAccountName") or ""
+    ).strip()
+    if not primary:
+        lines = out.get("journalLines")
+        if isinstance(lines, list):
+            for row in lines:
+                if not isinstance(row, dict):
+                    continue
+                memo = str(row.get("memo") or "").lower()
+                if memo == "cartola":
+                    continue
+                acc = row.get("accountName") or row.get("accountId") or row.get(
+                    "accountCode"
+                )
+                if acc:
+                    out["primaryAccountName"] = str(acc)
+                    break
+    if not str(out.get("category") or "").strip():
+        out["category"] = (
+            "movimiento_bancario" if kind == "bank_statement_line" else "general"
+        )
+    if not str(out.get("taxTreatment") or "").strip():
+        out["taxTreatment"] = "unknown"
+    return out
+
+
+def pick_rag_relaxed_fallback(
+    examples: list[dict],
+    input_text: str,
+    *,
+    kind: str,
+    max_dist: float = 0.55,
+) -> dict | None:
+    """Si el LLM falla, reutiliza el mejor ejemplo histórico con cuentas válidas."""
+    target_cp = extract_counterparty(input_text)
+    for ex in examples:
+        payload = _payload_as_dict(ex.get("payloadJson"))
+        if not primary_from_learn_payload(payload):
+            continue
+        ex_cp = extract_counterparty(str(ex.get("inputText") or ""))
+        dist = float(ex.get("dist", 999.0))
+        if counterparties_match(target_cp, ex_cp):
+            return ex
+        if kind == "bank_statement_line" and dist <= max_dist:
+            return ex
+    return None
 
 
 def bank_suggested_entry_from_learn_payload(
@@ -559,11 +682,7 @@ def bank_suggested_entry_from_learn_payload(
     chart: list[dict],
 ) -> dict[str, Any] | None:
     """Asiento sugerido para cartola desde ejemplo confirmado (orden UI: banco, contrapartida)."""
-    bank_name = str(payload.get("bankAccountName") or "").strip()
-    counter_name = (
-        str(payload.get("counterAccountName") or "").strip()
-        or str(payload.get("primaryAccountName") or "").strip()
-    )
+    bank_name, counter_name = bank_accounts_from_learn_payload(payload)
     if not bank_name or not counter_name:
         return None
 
@@ -637,11 +756,13 @@ def pick_rag_short_circuit_example(
     dist = float(best.get("dist", 999.0))
     target_cp = extract_counterparty(input_text)
     ex_cp = extract_counterparty(str(best.get("inputText") or ""))
-    same_cp = bool(target_cp and ex_cp and target_cp == ex_cp)
+    same_cp = counterparties_match(target_cp, ex_cp)
+    payload = _payload_as_dict(best.get("payloadJson"))
+    if same_cp and primary_from_learn_payload(payload):
+        return best
     limit = max_dist_same_counterparty if same_cp else max_dist
     if dist > limit:
         return None
-    payload = _payload_as_dict(best.get("payloadJson"))
     if not primary_from_learn_payload(payload):
         return None
     return best
@@ -697,6 +818,10 @@ def build_rag_short_circuit_result(
         "Clasificación desde ejemplo histórico (sin LLM).",
         *vat_warnings,
     ]
+    if float(example.get("dist", 1.0)) > settings.rag_short_circuit_max_dist:
+        warnings.append(
+            "Reutilizado por similitud de contraparte o fallback RAG (el LLM no respondió bien)."
+        )
 
     total_ms = _elapsed_ms(t0)
     result: dict[str, Any] = {
@@ -973,7 +1098,7 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
     try:
         for attempt in range(2):
             chat_out = await ollama_client.ollama_chat_json(messages)
-            raw = chat_out["json"]
+            raw = salvage_model_classification(chat_out["json"], kind)
             latency = chat_out["latencyMs"]
             if is_valid_classification(raw):
                 break
@@ -1003,6 +1128,26 @@ async def run_classify(body: dict[str, Any]) -> dict[str, Any]:
         return error_result(request_id, inp, f"LLM error: {e!s}")
 
     if not is_valid_classification(raw):
+        relaxed = pick_rag_relaxed_fallback(
+            examples,
+            input_text,
+            kind=kind,
+        )
+        if relaxed is not None:
+            return build_rag_short_circuit_result(
+                body=body,
+                request_id=request_id,
+                inp=inp,
+                kind=kind,
+                purpose=purpose,
+                example=relaxed,
+                examples=examples,
+                chart=chart,
+                input_text=input_text,
+                wants_entry=wants_entry,
+                explain=explain,
+                t0=t0,
+            )
         log_event(
             logger,
             "classify_error",

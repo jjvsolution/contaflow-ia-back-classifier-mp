@@ -7,8 +7,11 @@ import unittest
 from app.classify_engine import (
     bank_suggested_entry_from_learn_payload,
     build_rag_short_circuit_result,
+    is_valid_classification,
+    pick_rag_relaxed_fallback,
     pick_rag_short_circuit_example,
     primary_from_learn_payload,
+    salvage_model_classification,
 )
 from app.input_text import build_input_text, extract_bank_counterparty
 
@@ -41,6 +44,77 @@ class BankLearnPayloadTests(unittest.TestCase):
             "bankAccountName": "1.1.01.003 - Banco cuenta corriente",
         }
         self.assertIn("Proveedores", primary_from_learn_payload(payload))
+
+    def test_short_circuit_acepta_misma_contraparte_aunque_distancia_alta(self):
+        ex = pick_rag_short_circuit_example(
+            [
+                {
+                    "id": "bank-2",
+                    "dist": 0.42,
+                    "inputText": (
+                        "tipo:bank_statement_line\n"
+                        "contraparte:higiene demo spa\n"
+                        "texto:Pago Higiene Demo SpA"
+                    ),
+                    "payloadJson": {
+                        "primaryAccountName": "5.1.01.001 - Gastos",
+                        "bankAccountName": "1.1.01.001 - Caja",
+                    },
+                }
+            ],
+            (
+                "tipo:bank_statement_line\n"
+                "contraparte:higiene demo spa\n"
+                "texto:Pago Higiene Demo SpA folio 10008"
+            ),
+            max_dist=0.22,
+            max_dist_same_counterparty=0.35,
+        )
+        self.assertIsNotNone(ex)
+
+    def test_relaxed_fallback_tras_fallo_llm(self):
+        examples = [
+            {
+                "id": "legacy",
+                "dist": 0.48,
+                "inputText": "tipo:bank_statement_line\ncontraparte:notaria demo ltda",
+                "payloadJson": {
+                    "lines": [
+                        {
+                            "accountName": "2.1.01.001 - Proveedores",
+                            "debit": "100",
+                            "memo": "Pago",
+                        },
+                        {
+                            "accountName": "1.1.01.003 - Banco cuenta corriente",
+                            "credit": "100",
+                            "memo": "Cartola",
+                        },
+                    ]
+                },
+            }
+        ]
+        picked = pick_rag_relaxed_fallback(
+            examples,
+            "tipo:bank_statement_line\ncontraparte:notaria demo ltda\ntexto:Pago Notaria Demo",
+            kind="bank_statement_line",
+        )
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["id"], "legacy")
+
+    def test_salvage_journal_lines_para_validacion(self):
+        raw = salvage_model_classification(
+            {
+                "journalLines": [
+                    {"accountName": "2.1.01.001 - Proveedores", "debit": "100"},
+                    {"accountName": "1.1.01.003 - Banco", "credit": "100", "memo": "Cartola"},
+                ]
+            },
+            "bank_statement_line",
+        )
+        self.assertEqual(raw["primaryAccountName"], "2.1.01.001 - Proveedores")
+        self.assertEqual(raw["category"], "movimiento_bancario")
+        self.assertTrue(is_valid_classification(raw))
 
     def test_short_circuit_acepta_payload_cartola(self):
         ex = pick_rag_short_circuit_example(
